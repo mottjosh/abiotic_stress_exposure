@@ -3,13 +3,11 @@ dir <- getwd()
 source(paste0(dir,"/Scripts/0_functions.r"))
 
 # Packages --------------------------------------------------------------
-
-# All packages used throughout analysis. 
 packages <- c(
   # general
-  "tidyverse", 'daymetr', 'data.table', 'janitor', 'soilDB', 'sf',
-  # stats
-  'mgcv', 'gratia', 'lme4', 'lmerTest',
+  "tidyverse", 'data.table', 'janitor', 
+  # ssurgo and mapping
+  'daymetr', "sf", "tigris", "maptiles", "tidyterra", "terra", 'soilDB',
   # plotting
   'ggthemes', 'patchwork', 'latex2exp', 'viridis', 'GGally', 'ggpubr', 'scico',
   'geomtextpath')
@@ -262,13 +260,10 @@ get_mukey <- function(lat,long){
   res$mukey[1]
 }
 
-site_coords <- coordinates %>%
-  rowwise() %>%
-  mutate(mukey = get_mukey(lat, long)) %>%
-  ungroup()
-
 get_awhc <- function(mukey, rooting_depth_cm = ROOTING_DEPTH_CM) {
   
+  # example 517092, blacksburg 
+  # mukey <- 517092
   q <- sprintf("
     SELECT c.cokey, c.comppct_r, h.hzdept_r, h.hzdepb_r, h.awc_r
     FROM component c
@@ -280,34 +275,32 @@ get_awhc <- function(mukey, rooting_depth_cm = ROOTING_DEPTH_CM) {
   df <- SDA_query(q)
   if (is.null(df) || nrow(df) == 0) return(NA_real_)
   
-  dom_cokey <- df$cokey[which.max(df$comppct_r)]
+  dom_cokey <- df$cokey[which.max(df$comppct_r)] # select the dominant soil series
   
-  df %>%
-    filter(cokey == dom_cokey, hzdept_r < rooting_depth_cm, !is.na(awc_r)) %>%
-    mutate(
-      hz_bottom_clipped = pmin(hzdepb_r, rooting_depth_cm),
-      thickness_cm = hz_bottom_clipped - hzdept_r
-    ) %>%
-    filter(thickness_cm > 0) %>%
-    summarise(awhc_mm = sum(awc_r * thickness_cm * 10, na.rm = TRUE)) %>%
-    pull(awhc_mm)
+  df <- df[df$cokey == dom_cokey & df$hzdept_r < rooting_depth_cm & !is.na(df$awc_r), ]
+  df$hz_bottom_clipped <- pmin(df$hzdepb_r, rooting_depth_cm)
+  df$thickness_cm <- df$hz_bottom_clipped - df$hzdept_r
+  
+  pos <- which(df$thickness_cm > 0)
+  awhc_mm <- sum(df$awc_r[pos] * df$thickness_cm[pos] * 10, na.rm = TRUE)
+  
+  return(awhc_mm)
 }
 
-site_coords <- site_coords %>%
-  rowwise() %>%
-  mutate(awhc_mm = get_awhc(mukey)) %>%
-  ungroup()
+
+site_coords <- coordinates
+site_coords$mukey <- mapply(get_mukey, site_coords$lat, site_coords$long)
+site_coords$awhc_mm <- mapply(get_awhc, site_coords$mukey)
+
 
 site_coords   ### looks reasonable enough for now... will have to double check later
 
 
-obsclim <- obsclim %>%
-  left_join(site_coords %>% dplyr::select(loc, awhc_mm), by = c("site" = 'loc'))
-
-obsclim %>% distinct(site, awhc_mm) # may consider taking several points and averaging within each site
+obsclim <- merge(obsclim, site_coords[, c("loc", "awhc_mm")],
+                 by.x = "site", by.y = "loc", all.x = TRUE)
 
 
-# Evapotranspiratio (Hargreaves-Samani) -----------------------------------------------------
+# Evapotranspiration (Hargreaves-Samani) -----------------------------------------------------
 
 
 ## we will start with this equation but sure there are better options
@@ -317,28 +310,23 @@ obsclim %>% distinct(site, awhc_mm) # may consider taking several points and ave
 
 ##https://www.fao.org/4/x0490e/x0490e00.htm
 
-
-obsclim <- obsclim %>%
-  mutate(eto_mm = calc_ETo_hargreaves(tmax_c, tmin_c, doy, latitude ))
+obsclim$eto_mm <- mapply(calc_ETo_hargreaves, obsclim$tmax_c, obsclim$tmin_c, obsclim$doy, obsclim$latitude)
 
 summary(obsclim$eto_mm)   # should be roughly 0-8 mm/day for this region/season range,
 # negative or NA values indicate a join/data problem
 
-obsclim %>%
-  filter(is.na(eto_mm)) %>%
-  count(site)   # any site with all-NA ETo likely failed the latitude join
-
 
 str(obsclim)
 
-ggplot(obsclim %>% filter(harvyr == max(harvyr, na.rm = TRUE)), aes(x = date, y = eto_mm)) +
-  geom_line() +
-  facet_wrap(~site) +
-  labs(title = "Daily ETo (Hargreaves), 2021",
-       y = "ETo (mm/day)") +
-  theme_classic()
+# ggplot(obsclim[obsclim$harvyr == 2021 & !is.na(obsclim$eto_mm),], 
+#        aes(x = date, y = eto_mm)) +
+#   geom_line() +
+#   facet_wrap(~site) +
+#   labs(title = "Daily ETo (Hargreaves), 2021",
+#        y = "ETo (mm/day)") +
+#   theme_classic()
 
-ggsave("Figures/ET0.png", plot = last_plot(), width = 8, height = 5, unit = "in")
+# ggsave("Figures/ET0.png", plot = last_plot(), width = 8, height = 5, unit = "in")
 
 # Atmospheric Water Deficit (AWD) -----------------------------------------
 # 15-day running sums of ETo and precipitation; AWD = ETo_15d - precip_15d.
@@ -351,357 +339,95 @@ AWHC_THRESHOLD <- c(0.4, 0.3, 0.5)
 AWHC_EXCESS_THRESHOLD <- c(.4, .2) # 40% is a good start
 
 
-daily_stress <- obsclim %>%
-  arrange(site, harvyr, date) %>%
-  group_by(site, harvyr) %>%
-  mutate(
-    # 15-day rolling sum
-    eto_15d    = zoo::rollsumr(eto_mm, k = 15, fill = NA),
-    precip_15d = zoo::rollsumr(prcp_mm, k = 15, fill = NA),
-    awd_mm_15     = eto_15d - precip_15d,
-    # 10-day rolling sum
-    eto_10d    = zoo::rollsumr(eto_mm, k = 10, fill = NA),
-    precip_10d = zoo::rollsumr(prcp_mm, k = 10, fill = NA),
-    awd_mm_10     = eto_10d - precip_10d,
-    # 7-Day rolling Sum
-    eto_7d    = zoo::rollsumr(eto_mm, k = 7, fill = NA),
-    precip_7d = zoo::rollsumr(prcp_mm, k = 7, fill = NA),
-    awd_mm_7 = eto_7d - precip_7d,
-    # Can think about changing this over time
-    wd_day_15   = awd_mm_15 > AWHC_THRESHOLD[1] * awhc_mm,
-    wd_day_10   = awd_mm_10 > AWHC_THRESHOLD[1] * awhc_mm,
-    wd_day_7   = awd_mm_7  > AWHC_THRESHOLD[1] * awhc_mm,
-    #excess days (starting with 15 day rolling)
-    excess_day = awd_mm_15 < -(AWHC_EXCESS_THRESHOLD[1] * awhc_mm)) %>%
-  ungroup()
+daily_stress <- obsclim[order(obsclim$site, obsclim$harvyr, obsclim$date), ]
 
-
-excess_prob <- daily_stress %>%
-  filter(!is.na(excess_day)) %>%
-  group_by(site, doy) %>%
-  summarise(p_excess = mean(excess_day), n_years = n(), .groups = "drop")
-
-wd_prob <- daily_stress %>%
-  filter(!is.na(wd_day_15)) %>%
-  group_by(site, doy) %>%
-  summarise(
-    p_wd = mean(wd_day_15),
-    n_years = n(),
-    .groups = "drop"
-  )
-
-
-TARGET_P <- 0.1
-SPRING_DOY_RANGE <- c(100, 200)   # restrict the regression to the spring
-# transition window -- adjust based on
-# what the plot above actually shows;
-# this range should bracket where p_wd
-# visibly rises from near 0 toward 1
-
-find_onset_doy <- function(df, target_p = TARGET_P, doy_range = SPRING_DOY_RANGE) {
-  fit_data <- df %>% filter(doy >= doy_range[1], doy <= doy_range[2])
-  if (nrow(fit_data) < 3 || sd(fit_data$p_wd, na.rm = TRUE) == 0) return(NA_real_)
+for (k in c(15, 10, 7)) {
+  eto <- ave(daily_stress$eto_mm,  daily_stress$site, daily_stress$harvyr,
+             FUN = function(v) zoo::rollsumr(v, k = k, fill = NA))
+  pr  <- ave(daily_stress$prcp_mm, daily_stress$site, daily_stress$harvyr,
+             FUN = function(v) zoo::rollsumr(v, k = k, fill = NA))
   
-  m <- lm(p_wd ~ doy, data = fit_data)
-  intercept <- coef(m)[1]
-  slope <- coef(m)[2]
-  if (slope == 0) return(NA_real_)
-  
-  (target_p - intercept) / slope
+  daily_stress[[paste0("eto_", k, "d")]]    <- eto
+  daily_stress[[paste0("precip_", k, "d")]] <- pr
+  daily_stress[[paste0("awd_mm_", k)]]      <- eto - pr
+  daily_stress[[paste0("wd_day_", k)]]      <- (eto - pr) > AWHC_THRESHOLD[1] * daily_stress$awhc_mm
 }
 
-wd_onset <- wd_prob %>%
-  group_by(site) %>%
-  group_modify(~ tibble(onset_doy = find_onset_doy(.x))) %>%
-  ungroup()
+daily_stress$excess_day <- daily_stress$awd_mm_15 < 
+  -(AWHC_EXCESS_THRESHOLD[1] * daily_stress$awhc_mm)
 
-wd_onset   # DOY per site when spring AWD risk crosses p = .2 --
-# compare this against each line's actual heading date (hd_all)
-# to get "days before/after heading with elevated AWD risk"
-
-# sanity check: does onset_doy fall inside SPRING_DOY_RANGE and look
-# consistent with the rising-limb pattern visible in the plot above?
-# if a site's onset_doy looks implausible, its p_wd curve may not have
-# a clean single rising limb in that window -- worth plotting that
-# site individually before trusting the regression
-
-
-
-# Heading date exploration  -----------------------------------------------
-
-## 2 objectives, 
-### - Explore ability to impute heading date based on GDD
-### - find reference heading date for each location
-
-## Q: is the total thermal time a line needs to reach heading roughly constant
-
-
-CAL_SITES <- c("Blacksburg", "Warsaw")
-MIN_YEARS_LINE <- 3      # matches the project's existing >=3-year rule
-TBASE <- 0                # McMaster & Wilhelm (1997) / Lollato et al. (2020)
-# use Tbase = 0C for the Jan-1-anchored GDD calc --
-# NOTE: this is a different GDD definition than the
-# DAP-anchored, base-4.5C c_gdd_2 used in the earlier
-# random-regression script. Keep these separate.
-
-
-## 1. Build cumulative GDD from 1 January, per site-year --------------------
-
-obsclim_jan1 <- obsclim %>%
-  mutate(
-    doy = yday(date),
-    gdd_daily = pmax(((tmax_c + tmin_c) / 2) - TBASE, 0)
-  ) %>%
-  # restart the cumulative sum at Jan 1 of the *calendar* year, not the
-  # harvyr-anchored planting date used elsewhere -- filter to Jan-Jul,
-  # since heading occurs well before harvyr's fall planting starts again
-  filter(month(date) <= 7) %>%
-  arrange(site, harvyr, date) %>%
-  group_by(site, harvyr) %>%
-  mutate(cum_gdd_jan1 = cumsum(gdd_daily)) %>%
-  ungroup()
-
-
-## 2. Get each line's GDD-at-heading, at the 2 calibration sites ------------
-
-hd_cal <- cleanYldData %>% clean_names() %>%
-  mutate(harvyr = as.numeric(as.character(harvyr)), site = str_trim(site)) %>%
-  dplyr::select(id, site, harvyr, hd) %>%
-  filter(site %in% CAL_SITES, !is.na(hd)) %>% #drop NA's
-  mutate(HD = as.Date(hd - 1, origin = paste0(harvyr, "-01-01"))) %>%  # DOY -> Date
-  # rename(HD = hd) %>%
-  left_join(
-    obsclim_jan1 %>% dplyr::select(site, harvyr, date, cum_gdd_jan1),
-    by = c("site", "harvyr", "HD" = "date")
-  ) 
-years_per_line <- hd_cal %>% distinct(id, harvyr) %>% count(id, name = "n_years")
-keep_lines <- years_per_line %>% filter(n_years >= MIN_YEARS_LINE) %>% pull(id)
-
-hd_cal <- hd_cal %>% filter(id %in% keep_lines, !is.na(cum_gdd_jan1))
-
-obsclim_jan1 %>%
-  count(site, harvyr, date) %>%
-  filter(n > 1)
-
-# does the duplication already exist in the base obsclim, or did it
-# get introduced somewhere in this script's pipeline?
-obsclim %>% count(site, harvyr, date) %>% filter(n > 1) %>% nrow()
-
-# if duplicates exist, look at one specific case to understand the shape
-dup_keys <- obsclim_jan1 %>% count(site, harvyr, date) %>% filter(n > 1) %>% slice(1)
-obsclim_jan1 %>% semi_join(dup_keys, by = c("site", "harvyr", "date"))
-
-fulldate %>%
-  filter(Location == "Warsaw") %>%
-  arrange(Harvest.Year) %>%   # or whatever the year column is called there
-  print(n = Inf)
-
-site_consistency <- hd_cal %>%
-  group_by(id, site) %>%
-  summarise(mean_gdd_req = mean(cum_gdd_jan1, na.rm = TRUE),
-            n = n(), .groups = "drop") %>%
-  pivot_wider(names_from = site, values_from = c(mean_gdd_req, n))
-
-## some of the Warsaw GDD's are much higher than Blacksburg for the same ID
-
-
-# only meaningful for lines actually observed at both calibration sites
-site_consistency_paired <- site_consistency %>%
-  filter(!is.na(mean_gdd_req_Blacksburg), !is.na(mean_gdd_req_Warsaw))
-
-
-nrow(site_consistency_paired)   # how many lines can this check even run on
-
-line_diffs <- site_consistency_paired %>%
-  mutate(gdd_diff = mean_gdd_req_Warsaw - mean_gdd_req_Blacksburg)
-
-mean_diff <- mean(line_diffs$gdd_diff, na.rm = TRUE)
-sd_diff   <- sd(line_diffs$gdd_diff, na.rm = TRUE)
-
-line_diffs <- line_diffs %>%
-  mutate(z_score = (gdd_diff - mean_diff) / sd_diff,
-         flag_outlier = abs(z_score) > 2.5)   # or 2.5/3, depending how conservative you want
-
-line_diffs %>% filter(flag_outlier) %>% arrange(desc(abs(z_score)))
-
-ggplot(line_diffs, aes(gdd_diff)) +
-  geom_histogram(bins = 50) +
-  geom_vline(xintercept = mean_diff, color = "red") +
-  labs(title = "Distribution of Warsaw - Blacksburg GDD requirement difference",
-       x = "GDD difference (Warsaw - Blacksburg)")
-
-
-# paired comparison: is a line's GDD requirement the same at both sites?
-cor.test(site_consistency_paired$mean_gdd_req_Blacksburg,
-         site_consistency_paired$mean_gdd_req_Warsaw)
-
-t.test(site_consistency_paired$mean_gdd_req_Blacksburg,
-       site_consistency_paired$mean_gdd_req_Warsaw, paired = TRUE)
-
-ggplot(site_consistency_paired, aes(mean_gdd_req_Blacksburg, mean_gdd_req_Warsaw)) +
-  geom_point() +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
-  geom_smooth(method = "lm", se = TRUE) +
-  labs(title = "Per-line GDD-to-heading requirement: Blacksburg vs. Warsaw",
-       x = "Mean GDD requirement, Blacksburg", y = "Mean GDD requirement, Warsaw")
-
-# 3b. Flag and remove outlier lines (site-to-site requirement wildly
-##     inconsistent, beyond the typical systematic offset) ------------------
-# z-score rule on the Warsaw-Blacksburg difference, not on the raw
-# requirement itself, since a modest systematic offset between the two
-# sites is expected and not itself a problem -- only large deviations
-# FROM that typical offset get flagged
-
-OUTLIER_Z_THRESHOLD <- 2   # adjust if this flags too many/few lines;
-# 2-3 is a common range for this kind of rule
-
-line_diffs <- site_consistency_paired %>%
-  mutate(gdd_diff = mean_gdd_req_Warsaw - mean_gdd_req_Blacksburg)
-
-mean_diff <- mean(line_diffs$gdd_diff, na.rm = TRUE)
-sd_diff   <- sd(line_diffs$gdd_diff, na.rm = TRUE)
-
-line_diffs <- line_diffs %>%
-  mutate(z_score = (gdd_diff - mean_diff) / sd_diff,
-         flag_outlier = abs(z_score) > OUTLIER_Z_THRESHOLD)
-
-ggplot(line_diffs, aes(gdd_diff)) +
-  geom_histogram(bins = 30) +
-  geom_vline(xintercept = mean_diff, color = "red") +
-  labs(title = "Distribution of Warsaw - Blacksburg GDD requirement difference",
-       subtitle = paste0(sum(line_diffs$flag_outlier), " lines flagged as outliers (|z| > ",
-                         OUTLIER_Z_THRESHOLD, ")"),
-       x = "GDD difference (Warsaw - Blacksburg)")
-
-outlier_ids <- line_diffs %>% filter(flag_outlier) %>% pull(id)
-outlier_ids   # keep a record of exactly which lines were dropped, and why,
-# for the methods write-up
-
-line_diffs %>% filter(flag_outlier) %>% arrange(desc(abs(z_score)))
-
-# remove outlier lines from hd_cal before the pooled requirement is fit,
-# so they don't influence m_req at all (not just excluded from output)
-hd_cal <- hd_cal %>% filter(!id %in% outlier_ids)
-
-
-## 4. Final per-line GDD requirement (pooled across calibration sites) ------
-# using a mixed model with line random intercept lets lines with fewer
-# observations borrow strength, same logic as the earlier random-regression
-# approach, but now just for a single scalar per line rather than a slope
-
-m_req <- lmer(hd ~ cum_gdd_jan1 + 1 + (1 | id), data = hd_cal)
-
-line_req <- ranef(m_req)$id %>%
-  as.data.frame() %>%
-  rownames_to_column("id") %>%
-  rename(dev = `(Intercept)`) %>%
-  mutate(gdd_requirement = fixef(m_req)[1] + dev) %>%
-  dplyr::select(id, gdd_requirement)
-
-line_req   # each line's final calibrated GDD-to-heading requirement
-
-
-## 5. Validate: how well does this reproduce known HD at the calibration
-##    sites themselves? (in-sample check, comparable to the paper's own
-##    RMSD/r2 validation of their phenology model) ---------------------------
-
-find_heading_doy <- function(site_i, harvyr_i, gdd_target) {
-  traj <- obsclim_jan1 %>% filter(site == site_i, harvyr == harvyr_i) %>% arrange(date)
-  hit <- traj %>% filter(cum_gdd_jan1 >= gdd_target) %>% slice(1)
-  if (nrow(hit) == 0) return(as.Date(NA))
-  hit$date
+prob_by_site_doy <- function(data, flag, name) {
+  # data <- daily_stress; flag <- "excess_day"; name <- "p_excess"
+  d <- data[!is.na(data[[flag]]), ]
+  grp <- list(site = d$site, doy = d$doy)
+  
+  out <- aggregate(d[[flag]], by = grp, FUN = mean)
+  out$n_years <- aggregate(d[[flag]], by = grp, FUN = length)$x
+  names(out)[names(out) == "x"] <- name
+  out
 }
 
-validation <- hd_cal %>%
-  left_join(line_req, by = "id") %>%
-  rowwise() %>%
-  mutate(HD_predicted = find_heading_doy(site, harvyr, gdd_requirement)) %>%
-  ungroup() %>%
-  mutate(resid_days = as.numeric(HD - HD_predicted))
+daily_stress$freeze_day <- daily_stress$tmin_c < 0 
+daily_stress$heat_day <- daily_stress$tmax_c > 27
 
-validation %>%
-  summarise(
-    RMSD = sqrt(mean(resid_days^2, na.rm = TRUE)),
-    MAD  = mean(abs(resid_days), na.rm = TRUE),
-    bias = mean(resid_days, na.rm = TRUE),
-    r2   = cor(as.numeric(HD), as.numeric(HD_predicted), use = "complete.obs")^2
-  )
+# test <- c(TRUE, TRUE, FALSE, FALSE)
+# mean(test)
+# length(test)
 
-ggplot(validation, aes(as.numeric(HD_predicted), as.numeric(HD))) +
+excess_prob <- prob_by_site_doy(daily_stress, "excess_day", "p_excess")
+wd_prob     <- prob_by_site_doy(daily_stress, "wd_day_15",  "p_wd")
+freeze_prob <- prob_by_site_doy(daily_stress, "freeze_day", "p_freeze")
+heat_prob     <- prob_by_site_doy(daily_stress, "heat_day",  "p_heat")
+
+#water deficit probability DOY
+ggplot(wd_prob, aes(doy, p_wd)) +
   geom_point(alpha = 0.4) +
-  geom_abline(slope = 1, intercept = 0, color = "red") +
-  labs(title = "Validation: predicted vs. actual HD at calibration sites",
-       x = "Predicted HD (thermal-time model)", y = "Actual HD")
+  facet_wrap(~site) +
+  labs(title = "Probability of 15-d AWD > 40% AWHC, by day of year",
+       x = "Day of year", y = "P(water deficit)")
+ggsave("Figures/prob_wd.png", plot = last_plot(), width = 8, height = 4, unit = 'in')
 
-# compare this RMSD/r2 directly against the paper's own reported values
-# (RMSD = 8 d, r2 = .67) as a benchmark for whether this simpler,
-# per-line approach is performing comparably
-loyo_validation <- hd_cal %>%
-  distinct(id, harvyr) %>%
-  pmap_dfr(function(id, harvyr) {
-    train <- hd_cal %>% filter(id == !!id, harvyr != !!harvyr)
-    if (nrow(train) == 0) return(NULL)
-    
-    req_loyo <- mean(train$cum_gdd_jan1, na.rm = TRUE)
-    
-    test_row <- hd_cal %>% filter(id == !!id, harvyr == !!harvyr)
-    
-    test_row %>%
-      mutate(
-        gdd_requirement_loyo = req_loyo,
-        HD_predicted = pmap(list(site, harvyr, gdd_requirement_loyo),
-                            ~ find_heading_doy(..1, ..2, ..3))
-      )
-  }) %>%
-  mutate(HD_predicted = as.Date(unlist(HD_predicted), origin = "1970-01-01"),
-         resid_days = as.numeric(HD - HD_predicted))
-
-loyo_validation %>%
-  summarise(
-    RMSD = sqrt(mean(resid_days^2, na.rm = TRUE)),
-    MAD  = mean(abs(resid_days), na.rm = TRUE),
-    bias = mean(resid_days, na.rm = TRUE)
-  )
-
-ggplot(loyo_validation, aes(HD_predicted, HD)) +
+#water excess probability DOY
+ggplot(excess_prob, aes(doy, p_excess)) +
   geom_point(alpha = 0.4) +
-  geom_abline(slope = 1, intercept = 0, color = "red") +
-  scale_x_date(date_labels = "%b %d") +
-  scale_y_date(date_labels = "%b %d") +
-  labs(title = "Leave-one-year-out validation: predicted vs. actual HD",
-       x = "Predicted HD (LOYO)", y = "Actual HD")
+  facet_wrap(~site) +
+  labs(title = "Probability of 15-d AWD < -40% AWHC (excess water), by day of year",
+       x = "Day of year", y = "P(excess water)")
+ggsave("Figures/prob_we.png", plot = last_plot(), width = 8, height = 4, unit = 'in')
+
+#freeze day probability DOY
+ggplot(freeze_prob, aes(doy, p_freeze)) +
+  geom_point(alpha = 0.4) +
+  facet_wrap(~site) +
+  labs(title = "Probability of freeze day",
+       x = "Day of year", y = "P(T min < 0)")
+ggsave("Figures/prob_freeze.png", plot = last_plot(), width = 8, height = 4, unit = 'in')
+
+#heat excess probability DOY
+ggplot(heat_prob, aes(doy, p_heat)) +
+  geom_point(alpha = 0.4) +
+  facet_wrap(~site) +
+  labs(title = "Probability of High heat by day of year",
+       x = "Day of year", y = "P(T max > 27)")
+ggsave("Figures/prob_heat.png", plot = last_plot(), width = 8, height = 4, unit = 'in')
+
+freeze_counts <- aggregate(freeze_day ~ site + harvyr, 
+                           data = daily_stress,
+                           FUN = sum)
+
+heat_counts <- aggregate(heat_day ~ site + harvyr, 
+                           data = daily_stress,
+                           FUN = sum)
+
+wd_counts <- aggregate(wd_day_15 ~ site + harvyr, 
+                         data = daily_stress,
+                         FUN = sum)
+
+excess_counts <- aggregate(excess_day ~ site + harvyr, 
+                         data = daily_stress,
+                         FUN = sum)
 
 
-## 6. Impute heading date at every other site-year --------------------------
+# whole dataset
 
-impute_target <- cleanYldData %>%
-  mutate(harvyr = as.numeric(as.character(harvyr)), site = str_trim(site)) %>%
-  distinct(id, site, harvyr) %>%
-  filter(id %in% line_req$id, !id %in% outlier_ids) %>%   # drop flagged outliers here too
-  left_join(line_req, by = "id")
-
-impute_target <- impute_target %>%
-  rowwise() %>%
-  mutate(HD_imputed = find_heading_doy(site, harvyr, gdd_requirement)) %>%
-  ungroup()
-
-impute_target %>% filter(is.na(HD_imputed)) %>% count(site)
-# NAs likely mean that site-year's weather trajectory never reached the
-# line's GDD requirement within the Jan-Jul window kept above -- worth
-# checking whether that's a real agronomic signal (a line that's too
-# late-maturing for that site) or a window-length problem
-
-
-## 7. Sanity check against Massey --------------------------------------------
-
-massey_check <- impute_target %>%
-  filter(id == "Massey") %>%
-  arrange(harvyr, site) %>%
-  left_join(cleanYldData %>% mutate(harvyr = as.numeric(as.character(harvyr))) %>%
-              dplyr::select(id, site, harvyr, hd), by = c("id", "site", "harvyr"))
-
-massey_check
-# compare HD_imputed against hd (actual) at Blacksburg/Warsaw specifically
-# -- these rows should match closely since Massey's own requirement was
-# calibrated partly from its own data at those sites (in-sample check)
-
+full_data <- merge(daily_stress, clean_wht_data, sort = TRUE)
