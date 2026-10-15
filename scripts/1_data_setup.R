@@ -40,7 +40,7 @@ if (!file.exists("Data/daymet_data.RDS")) {
 daymet_data <- download_daymet_batch(
   file_location = 'LocationCoords.csv',
   start = 1990,
-  end = 2022,
+  end = 2023,
   internal = TRUE,
   simplify=TRUE)
 
@@ -243,7 +243,7 @@ clean_wht_data$site <- as.factor(clean_wht_data$site)
 clean_wht_data <- clean_wht_data[clean_wht_data$yield > 0 & clean_wht_data$yield < 200, ]
 clean_wht_data <- subset(clean_wht_data, select = -c(X.1, X))
 
-# summary(clean_wht_data)
+summary(clean_wht_data)
 # str(clean_wht_data)
 
 
@@ -379,55 +379,80 @@ wd_prob     <- prob_by_site_doy(daily_stress, "wd_day_15",  "p_wd")
 freeze_prob <- prob_by_site_doy(daily_stress, "freeze_day", "p_freeze")
 heat_prob     <- prob_by_site_doy(daily_stress, "heat_day",  "p_heat")
 
-#water deficit probability DOY
-ggplot(wd_prob, aes(doy, p_wd)) +
-  geom_point(alpha = 0.4) +
-  facet_wrap(~site) +
-  labs(title = "Probability of 15-d AWD > 40% AWHC, by day of year",
-       x = "Day of year", y = "P(water deficit)")
-ggsave("Figures/prob_wd.png", plot = last_plot(), width = 8, height = 4, unit = 'in')
+# #water deficit probability DOY
+# ggplot(wd_prob, aes(doy, p_wd)) +
+#   geom_point(alpha = 0.4) +
+#   facet_wrap(~site) +
+#   labs(title = "Probability of 15-d AWD > 40% AWHC, by day of year",
+#        x = "Day of year", y = "P(water deficit)")
+# ggsave("Figures/prob_wd.png", plot = last_plot(), width = 8, height = 4, unit = 'in')
+# 
+# #water excess probability DOY
+# ggplot(excess_prob, aes(doy, p_excess)) +
+#   geom_point(alpha = 0.4) +
+#   facet_wrap(~site) +
+#   labs(title = "Probability of 15-d AWD < -40% AWHC (excess water), by day of year",
+#        x = "Day of year", y = "P(excess water)")
+# ggsave("Figures/prob_we.png", plot = last_plot(), width = 8, height = 4, unit = 'in')
+# 
+# #freeze day probability DOY
+# ggplot(freeze_prob, aes(doy, p_freeze)) +
+#   geom_point(alpha = 0.4) +
+#   facet_wrap(~site) +
+#   labs(title = "Probability of freeze day",
+#        x = "Day of year", y = "P(T min < 0)")
+# ggsave("Figures/prob_freeze.png", plot = last_plot(), width = 8, height = 4, unit = 'in')
+# 
+# #heat excess probability DOY
+# ggplot(heat_prob, aes(doy, p_heat)) +
+#   geom_point(alpha = 0.4) +
+#   facet_wrap(~site) +
+#   labs(title = "Probability of High heat by day of year",
+#        x = "Day of year", y = "P(T max > 27)")
+# ggsave("Figures/prob_heat.png", plot = last_plot(), width = 8, height = 4, unit = 'in')
 
-#water excess probability DOY
-ggplot(excess_prob, aes(doy, p_excess)) +
-  geom_point(alpha = 0.4) +
-  facet_wrap(~site) +
-  labs(title = "Probability of 15-d AWD < -40% AWHC (excess water), by day of year",
-       x = "Day of year", y = "P(excess water)")
-ggsave("Figures/prob_we.png", plot = last_plot(), width = 8, height = 4, unit = 'in')
+count_stress_days <- function(data, flag_col, out_name, season = NULL) {
+  if (!is.null(season)) {
+    data <- data[data$season == season, ]
+  }
 
-#freeze day probability DOY
-ggplot(freeze_prob, aes(doy, p_freeze)) +
-  geom_point(alpha = 0.4) +
-  facet_wrap(~site) +
-  labs(title = "Probability of freeze day",
-       x = "Day of year", y = "P(T min < 0)")
-ggsave("Figures/prob_freeze.png", plot = last_plot(), width = 8, height = 4, unit = 'in')
+  counts <- aggregate(
+    list(tmp_col = data[[flag_col]]),
+    by = list(site = data$site, harvyr = data$harvyr),
+    FUN = function(x) sum(x, na.rm =T)
+  )
+  names(counts)[names(counts) == "tmp_col"] <- out_name
+  counts
+}
 
-#heat excess probability DOY
-ggplot(heat_prob, aes(doy, p_heat)) +
-  geom_point(alpha = 0.4) +
-  facet_wrap(~site) +
-  labs(title = "Probability of High heat by day of year",
-       x = "Day of year", y = "P(T max > 27)")
-ggsave("Figures/prob_heat.png", plot = last_plot(), width = 8, height = 4, unit = 'in')
+## full-season counts 
+freeze_counts <- count_stress_days(daily_stress, "freeze_day",  "freeze_day")
+heat_counts   <- count_stress_days(daily_stress, "heat_day",    "heat_day")
+wd_counts     <- count_stress_days(daily_stress, "wd_day_15",   "wd_day_15")
+excess_counts <- count_stress_days(daily_stress, "excess_day",  "excess_day")
 
-freeze_counts <- aggregate(freeze_day ~ site + harvyr, 
-                           data = daily_stress,
-                           FUN = sum)
+## spring-only counts 
+spring_freeze_count <- count_stress_days(daily_stress, "freeze_day", "spr_freeze_day", season = "spring")
+spring_heat_count   <- count_stress_days(daily_stress, "heat_day",   "spr_heat_day",   season = "spring")
+spring_excess_count <- count_stress_days(daily_stress, "excess_day", "spr_excess_day", season = "spring")
+spring_wd_count   <- count_stress_days(daily_stress, "wd_day_15",   "spr_wd_day_15",   season = "spring")
 
-heat_counts <- aggregate(heat_day ~ site + harvyr, 
-                           data = daily_stress,
-                           FUN = sum)
+## fall (planting-window) counts 
+fall_wd_count     <- count_stress_days(daily_stress, "wd_day_15",  "fall_wd_day_15",  season = "autumn")
+fall_excess_count <- count_stress_days(daily_stress, "excess_day", "fall_excess_day", season = "autumn")
+fall_freeze_count <- count_stress_days(daily_stress, "freeze_day", "fall_freeze_day", season = "autumn")
+fall_heat_count <- count_stress_days(daily_stress, "heat_day", "fall_heat_day", season = "autumn")
 
-wd_counts <- aggregate(wd_day_15 ~ site + harvyr, 
-                         data = daily_stress,
-                         FUN = sum)
+## combine 
+df_list <- list(freeze_counts, heat_counts, wd_counts, excess_counts,
+                spring_freeze_count, spring_heat_count,spring_excess_count,
+                spring_wd_count, fall_wd_count, fall_excess_count, fall_freeze_count,
+                fall_heat_count)
 
-excess_counts <- aggregate(excess_day ~ site + harvyr, 
-                         data = daily_stress,
-                         FUN = sum)
+
+stress_counts <- Reduce(function(x,y) merge(x,y, all = TRUE), df_list)
 
 
 # whole dataset
 
-full_data <- merge(daily_stress, clean_wht_data, sort = TRUE)
+full_data <- merge(stress_counts, clean_wht_data, sort = TRUE)
